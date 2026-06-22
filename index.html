@@ -10,19 +10,19 @@
     .box { border: 1px solid #ccc; padding: 20px; margin: 20px 0; }
     #roomId { user-select: all; cursor: pointer; font-weight: bold; }
     .status { color: #555; margin-top: 10px; }
-    .log-area { background: #f4f4f4; padding: 10px; margin-top: 10px; max-height: 150px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+    .log-area { background: #f4f4f4; padding: 10px; margin-top: 10px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
     .error { color: red; }
     .success { color: green; }
   </style>
 </head>
 <body>
-  <h1>📺 Partage d’écran + voix (WebRTC avec TURN)</h1>
+  <h1>📺 Partage d’écran + voix (WebRTC + serveur perso)</h1>
 
   <div class="box">
     <h2>Partager mon écran</h2>
     <button id="startBtn">Démarrer le partage</button>
     <button id="stopBtn" disabled>Arrêter</button>
-    <p>ID de partage : <strong id="roomId">—</strong> <span id="copyHint" style="color:green;display:none;">(copié !)</span></p>
+    <p>ID de la room : <strong id="roomId">—</strong> <span id="copyHint" style="color:green;display:none;">(copié !)</span></p>
     <video id="localVideo" autoplay muted playsinline></video>
     <div class="status" id="hostStatus"></div>
   </div>
@@ -40,45 +40,13 @@
     <div class="log-area" id="logArea">En attente…</div>
   </div>
 
-  <!-- PeerJS CDN -->
-  <script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
   <script>
     (function() {
-      // DOM
-      const startBtn = document.getElementById('startBtn');
-      const stopBtn = document.getElementById('stopBtn');
-      const roomIdSpan = document.getElementById('roomId');
-      const copyHint = document.getElementById('copyHint');
-      const localVideo = document.getElementById('localVideo');
-      const remoteVideo = document.getElementById('remoteVideo');
-      const joinBtn = document.getElementById('joinBtn');
-      const roomInput = document.getElementById('roomInput');
-      const hostStatus = document.getElementById('hostStatus');
-      const viewerStatus = document.getElementById('viewerStatus');
-      const logArea = document.getElementById('logArea');
-
-      let localStream = null;
-      let peer = null;
-      let currentCall = null;
-
-      function addLog(msg, type = 'info') {
-        const line = document.createElement('div');
-        line.className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
-        line.textContent = new Date().toLocaleTimeString() + ' - ' + msg;
-        logArea.appendChild(line);
-        logArea.scrollTop = logArea.scrollHeight;
-        console.log(msg);
-      }
-
-      function setHostStatus(msg) { hostStatus.textContent = msg; addLog('[Hôte] ' + msg); }
-      function setViewerStatus(msg) { viewerStatus.textContent = msg; addLog('[Spectateur] ' + msg); }
-
-      // Configuration ICE avec STUN/TURN publics (gratuits)
-      const iceServers = {
+      // Configuration des serveurs ICE (STUN/TURN gratuits)
+      const rtcConfig = {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' },
-          // Serveur TURN gratuit de Metreca (limité mais fonctionnel)
           {
             urls: 'turn:eu-0.turn.peerjs.com:3478',
             username: 'peerjs',
@@ -92,11 +60,107 @@
         ]
       };
 
+      // Connexion WebSocket au serveur (même origine)
+      const ws = new WebSocket(`ws://${location.host}`);
+      let localStream = null;
+      let peerConnection = null;
+      let isHost = false;
+      let roomId = null;
+
+      const localVideo = document.getElementById('localVideo');
+      const remoteVideo = document.getElementById('remoteVideo');
+      const startBtn = document.getElementById('startBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const roomIdSpan = document.getElementById('roomId');
+      const copyHint = document.getElementById('copyHint');
+      const joinBtn = document.getElementById('joinBtn');
+      const roomInput = document.getElementById('roomInput');
+      const hostStatus = document.getElementById('hostStatus');
+      const viewerStatus = document.getElementById('viewerStatus');
+      const logArea = document.getElementById('logArea');
+
+      function addLog(msg, type = 'info') {
+        const line = document.createElement('div');
+        line.className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
+        line.textContent = new Date().toLocaleTimeString() + ' - ' + msg;
+        logArea.appendChild(line);
+        logArea.scrollTop = logArea.scrollHeight;
+        console.log(msg);
+      }
+
+      function setHostStatus(msg) { hostStatus.textContent = msg; addLog('[Hôte] ' + msg); }
+      function setViewerStatus(msg) { viewerStatus.textContent = msg; addLog('[Spectateur] ' + msg); }
+
+      // Envoi de messages au serveur
+      function send(msg) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(msg));
+        } else {
+          addLog('WebSocket non connecté, impossible d’envoyer : ' + msg.type, 'error');
+        }
+      }
+
+      // Gestion des messages du serveur
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        addLog('Message reçu : ' + msg.type);
+        switch (msg.type) {
+          case 'registered':
+            if (isHost) {
+              roomId = msg.roomId;
+              roomIdSpan.textContent = roomId;
+              setHostStatus('Room prête, ID : ' + roomId);
+            }
+            break;
+
+          case 'viewer-joined':
+            if (isHost) {
+              setHostStatus(`Spectateur connecté (total : ${msg.viewerCount})`);
+              addLog('Un spectateur a rejoint, envoi de l’offre...');
+              // CORRECTION : on crée l’offre quoi qu’il arrive
+              if (!peerConnection) {
+                createHostPeerConnection();
+              }
+              createOffer();
+            }
+            break;
+
+          case 'offer':
+            if (!isHost) {
+              handleOffer(msg);
+            }
+            break;
+
+          case 'answer':
+            if (isHost && peerConnection) {
+              peerConnection.setRemoteDescription(new RTCSessionDescription(msg))
+                .then(() => addLog('Réponse distante appliquée'))
+                .catch(e => addLog('Erreur setRemoteDescription (answer) : ' + e.message, 'error'));
+            }
+            break;
+
+          case 'ice-candidate':
+            if (peerConnection && msg.candidate) {
+              peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate))
+                .catch(e => addLog('Erreur addIceCandidate : ' + e.message, 'error'));
+            }
+            break;
+
+          case 'error':
+            addLog('Erreur serveur : ' + msg.message, 'error');
+            alert('Erreur : ' + msg.message);
+            break;
+        }
+      };
+
+      ws.onopen = () => addLog('Connecté au serveur de signalisation');
+      ws.onclose = () => addLog('Déconnecté du serveur, rechargez la page');
+      ws.onerror = (err) => addLog('Erreur WebSocket', 'error');
+
       // --- Hôte : démarrer le partage ---
       startBtn.addEventListener('click', async () => {
         try {
-          addLog('Demande de partage d’écran…');
-          setHostStatus('Ouverture de la fenêtre de sélection d’écran…');
+          setHostStatus('Ouverture du sélecteur d’écran…');
           const screenStream = await navigator.mediaDevices.getDisplayMedia({
             video: true,
             audio: true
@@ -106,142 +170,149 @@
           try {
             const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             micStream.getAudioTracks().forEach(track => screenStream.addTrack(track));
-            setHostStatus('Microphone ajouté au flux.');
+            setHostStatus('Microphone ajouté');
           } catch (e) {
-            setHostStatus('Micro non disponible (partage sans micro).');
-            addLog('Micro refusé : ' + e.message, 'error');
+            setHostStatus('Micro indisponible');
           }
 
           localStream = screenStream;
           localVideo.srcObject = localStream;
+          isHost = true;
           startBtn.disabled = true;
           stopBtn.disabled = false;
 
-          // Connexion PeerJS avec TURN
-          setHostStatus('Connexion au serveur de signalisation…');
-          addLog('Création du Peer avec serveurs ICE…');
-          peer = new Peer({ config: iceServers });
+          // Générer un ID de room aléatoire
+          roomId = generateId();
+          send({ type: 'register', roomId });
+          setHostStatus('Création de la room...');
 
-          peer.on('open', (id) => {
-            roomIdSpan.textContent = id;
-            setHostStatus('Partage prêt ! ID : ' + id + ' (cliquez pour copier)');
-            addLog('Peer ouvert, ID : ' + id, 'success');
-          });
-
-          peer.on('call', (call) => {
-            addLog('Appel entrant de ' + call.peer);
-            call.answer(localStream);
-            call.on('stream', (remoteStream) => {
-              remoteVideo.srcObject = remoteStream;
-              setViewerStatus('');
-              addLog('Flux distant reçu (stream)', 'success');
-            });
-            call.on('error', (err) => {
-              addLog('Erreur sur l’appel : ' + err.message, 'error');
-            });
-            call.on('close', () => addLog('Appel fermé'));
-            currentCall = call;
-          });
-
-          peer.on('error', (err) => {
-            setHostStatus('Erreur PeerJS : ' + err.message);
-            addLog('Erreur PeerJS : ' + err.message, 'error');
-            alert('Erreur de connexion : ' + err.message);
-          });
-
-          peer.on('disconnected', () => {
-            addLog('Peer déconnecté du serveur de signalisation', 'error');
-            setHostStatus('Déconnecté du serveur');
-          });
-
-          localStream.getVideoTracks()[0].addEventListener('ended', () => {
-            stopSharing();
-          });
+          // Si l'utilisateur arrête le partage via l'UI du navigateur
+          localStream.getVideoTracks()[0].addEventListener('ended', () => stopSharing());
 
         } catch (err) {
-          console.error(err);
-          let msg = err.message;
-          if (err.name === 'NotAllowedError') msg = 'Permission refusée.';
-          setHostStatus('ÉCHEC : ' + msg);
-          addLog('Erreur de capture : ' + msg, 'error');
-          alert('Impossible de partager l’écran : ' + msg);
+          setHostStatus('Erreur : ' + err.message);
+          addLog('Erreur capture : ' + err.message, 'error');
         }
       });
 
+      function generateId() {
+        return Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+      }
+
+      // Créer une PeerConnection côté hôte
+      function createHostPeerConnection() {
+        if (peerConnection) peerConnection.close();
+        peerConnection = new RTCPeerConnection(rtcConfig);
+        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate) {
+            send({ type: 'ice-candidate', candidate: event.candidate });
+          }
+        };
+
+        peerConnection.oniceconnectionstatechange = () => {
+          addLog('ICE state (hôte) : ' + peerConnection.iceConnectionState);
+          if (peerConnection.iceConnectionState === 'failed') {
+            setHostStatus('Connexion échouée, redémarrage ICE...');
+            peerConnection.restartIce();
+          }
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+          addLog('Connection state (hôte) : ' + peerConnection.connectionState);
+        };
+      }
+
+      async function createOffer() {
+        try {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          send({ type: 'offer', sdp: offer.sdp, type: offer.type });
+          addLog('Offre envoyée au spectateur');
+        } catch (err) {
+          addLog('Erreur création offre : ' + err.message, 'error');
+        }
+      }
+
+      // --- Spectateur : rejoindre ---
+      joinBtn.addEventListener('click', () => {
+        const rid = roomInput.value.trim();
+        if (!rid) return alert('Entrez un ID');
+        roomId = rid;
+        isHost = false;
+        send({ type: 'join', roomId });
+        setViewerStatus('Rejoindre la room ' + rid + '...');
+      });
+
+      async function handleOffer(offer) {
+        if (peerConnection) peerConnection.close();
+        peerConnection = new RTCPeerConnection(rtcConfig);
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate) {
+            send({ type: 'ice-candidate', candidate: event.candidate });
+          }
+        };
+
+        peerConnection.ontrack = (event) => {
+          addLog('Track reçu : ' + event.track.kind);
+          if (event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+            setViewerStatus('Flux reçu !');
+            addLog('Flux distant affiché', 'success');
+          }
+        };
+
+        peerConnection.oniceconnectionstatechange = () => {
+          addLog('ICE state (spectateur) : ' + peerConnection.iceConnectionState);
+          if (peerConnection.iceConnectionState === 'failed') {
+            setViewerStatus('Connexion échouée');
+          }
+        };
+
+        try {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          send({ type: 'answer', sdp: answer.sdp, type: answer.type });
+          addLog('Réponse envoyée à l’hôte');
+        } catch (err) {
+          addLog('Erreur lors de la gestion de l’offre : ' + err.message, 'error');
+        }
+      }
+
+      // Arrêter le partage
       function stopSharing() {
-        addLog('Arrêt du partage…');
+        addLog('Arrêt du partage...');
         if (localStream) {
           localStream.getTracks().forEach(track => track.stop());
           localVideo.srcObject = null;
         }
-        if (currentCall) currentCall.close();
-        if (peer) peer.destroy();
+        if (peerConnection) peerConnection.close();
         startBtn.disabled = false;
         stopBtn.disabled = true;
         roomIdSpan.textContent = '—';
         setHostStatus('Partage arrêté');
         localStream = null;
-        peer = null;
-        currentCall = null;
+        peerConnection = null;
+        isHost = false;
+        roomId = null;
         remoteVideo.srcObject = null;
-        addLog('Partage arrêté');
       }
       stopBtn.addEventListener('click', stopSharing);
 
-      // --- Spectateur : rejoindre ---
-      joinBtn.addEventListener('click', () => {
-        const roomId = roomInput.value.trim();
-        if (!roomId) {
-          alert('Veuillez entrer un ID de partage');
-          return;
-        }
-        addLog('Tentative de rejoindre la room : ' + roomId);
-        const viewerPeer = new Peer({ config: iceServers });
-        
-        viewerPeer.on('open', () => {
-          setViewerStatus('Connexion au partage…');
-          addLog('Peer spectateur ouvert, appel de ' + roomId);
-          const call = viewerPeer.call(roomId, new MediaStream());
-          
-          call.on('stream', (remoteStream) => {
-            remoteVideo.srcObject = remoteStream;
-            setViewerStatus('Flux reçu !');
-            addLog('Flux reçu avec succès', 'success');
-          });
-          
-          call.on('error', (err) => {
-            setViewerStatus('Erreur d’appel : ' + err.message);
-            addLog('Erreur d’appel : ' + err.message, 'error');
-            alert('Erreur : ' + err.message);
-          });
-          
-          call.on('close', () => addLog('Appel fermé'));
-          currentCall = call;
-        });
-        
-        viewerPeer.on('error', (err) => {
-          setViewerStatus('Erreur PeerJS : ' + err.message);
-          addLog('Erreur PeerJS spectateur : ' + err.message, 'error');
-          alert('Erreur : ' + err.message);
-        });
-        
-        viewerPeer.on('disconnected', () => {
-          addLog('Spectateur déconnecté du serveur de signalisation', 'error');
-        });
-      });
-
-      // Copier l’ID
+      // Copier l'ID
       roomIdSpan.addEventListener('click', () => {
         const id = roomIdSpan.textContent;
         if (id && id !== '—') {
-          navigator.clipboard.writeText(id).then(() => {
-            copyHint.style.display = 'inline';
-            setTimeout(() => { copyHint.style.display = 'none'; }, 1500);
-          });
+          navigator.clipboard.writeText(id);
+          copyHint.style.display = 'inline';
+          setTimeout(() => { copyHint.style.display = 'none'; }, 1500);
         }
       });
 
-      addLog('Page chargée, prête.');
+      addLog('Page chargée, en attente de connexion WebSocket...');
     })();
   </script>
 </body>
